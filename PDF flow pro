@@ -1,0 +1,300 @@
+const express = require("express");
+const multer = require("multer");
+const fs = require("fs");
+const pdfParse = require("pdf-parse");
+const { PDFDocument, rgb } = require("pdf-lib");
+const cors = require("cors");
+
+const app = express();
+const upload = multer({ dest: "uploads/" });
+
+app.use(cors());
+app.use(express.json());
+
+// ===============================
+// SIMPLE DATABASE (IN MEMORY)
+// ===============================
+let DB = {
+    plans: {
+        free: { price: 0, limit: "basic" },
+        premium: { price: 9.99, limit: "advanced" },
+        pro: { price: 19.99, limit: "unlimited" }
+    },
+    coupons: {
+        SAVE10: { discount: 10 },
+        WELCOME20: { discount: 20 }
+    },
+    offers: {
+        active: true,
+        message: "Limited Time Offer: 20% OFF Pro Plan"
+    }
+};
+
+// ===============================
+// FRONTEND DASHBOARD + TOOL UI
+// ===============================
+app.get("/", (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+<title>PDF SaaS Tool</title>
+<style>
+body { font-family: Arial; background:#f4f4f4; }
+.container { width:80%; margin:auto; background:white; padding:20px; margin-top:20px; border-radius:10px; }
+textarea { width:100%; height:100px; }
+button { margin:5px; padding:10px; cursor:pointer; }
+.card { background:#eee; padding:10px; margin:10px 0; }
+input { padding:5px; margin:5px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<h1>PDF SaaS Tool</h1>
+
+<div id="offer"></div>
+
+<hr/>
+
+<h2>PDF → Text</h2>
+<input type="file" id="pdfFile"/>
+<button onclick="pdfToText()">Convert</button>
+<pre id="output"></pre>
+
+<hr/>
+
+<h2>Text → PDF</h2>
+<textarea id="text"></textarea><br/>
+<button onclick="textToPdf()">Generate PDF</button>
+
+<hr/>
+
+<h2>💰 Pricing Plans</h2>
+<div id="plans"></div>
+
+<hr/>
+
+<h2>🎟 Coupon Checker</h2>
+<input id="coupon" placeholder="Enter coupon"/>
+<button onclick="checkCoupon()">Apply</button>
+<div id="couponResult"></div>
+
+<hr/>
+
+<h2>🔐 ADMIN DASHBOARD</h2>
+
+<div class="card">
+<h3>Update Plans</h3>
+<input id="freePrice" placeholder="Free price"/>
+<input id="premiumPrice" placeholder="Premium price"/>
+<input id="proPrice" placeholder="Pro price"/>
+<button onclick="updatePlans()">Save Plans</button>
+</div>
+
+<div class="card">
+<h3>Create Coupon</h3>
+<input id="code" placeholder="Code"/>
+<input id="discount" placeholder="Discount %"/>
+<button onclick="createCoupon()">Create</button>
+</div>
+
+<div class="card">
+<h3>Toggle Offer</h3>
+<button onclick="toggleOffer()">Toggle Offer</button>
+</div>
+
+</div>
+
+<script>
+
+async function loadDashboard(){
+    const res = await fetch("/dashboard-data");
+    const data = await res.json();
+
+    document.getElementById("offer").innerHTML =
+        data.offers.active ? "<h3 style='color:green'>" + data.offers.message + "</h3>" : "";
+
+    let html = "";
+    for(let p in data.plans){
+        html += `<div class='card'>
+            <b>${p.toUpperCase()}</b><br/>
+            Price: $${data.plans[p].price}<br/>
+            Limit: ${data.plans[p].limit}
+        </div>`;
+    }
+    document.getElementById("plans").innerHTML = html;
+}
+
+loadDashboard();
+
+// ================= PDF TO TEXT =================
+async function pdfToText(){
+    const file = document.getElementById("pdfFile").files[0];
+    const form = new FormData();
+    form.append("file", file);
+
+    const res = await fetch("/pdf-to-text", { method:"POST", body:form });
+    const data = await res.json();
+
+    document.getElementById("output").innerText = data.text;
+}
+
+// ================= TEXT TO PDF =================
+async function textToPdf(){
+    const text = document.getElementById("text").value;
+
+    const res = await fetch("/text-to-pdf", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ text })
+    });
+
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "file.pdf";
+    a.click();
+}
+
+// ================= COUPON =================
+async function checkCoupon(){
+    const code = document.getElementById("coupon").value;
+
+    const res = await fetch("/check-coupon", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ code })
+    });
+
+    const data = await res.json();
+    document.getElementById("couponResult").innerText =
+        data.valid ? "Valid Discount: " + data.discount + "%" : "Invalid Coupon";
+}
+
+// ================= ADMIN =================
+async function updatePlans(){
+    await fetch("/admin/plans", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+            free: document.getElementById("freePrice").value,
+            premium: document.getElementById("premiumPrice").value,
+            pro: document.getElementById("proPrice").value
+        })
+    });
+    loadDashboard();
+}
+
+async function createCoupon(){
+    await fetch("/admin/coupon", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+            code: document.getElementById("code").value,
+            discount: document.getElementById("discount").value
+        })
+    });
+    alert("Coupon Created");
+}
+
+async function toggleOffer(){
+    await fetch("/admin/offer", { method:"POST" });
+    loadDashboard();
+}
+
+</script>
+
+</body>
+</html>
+    `);
+});
+
+// ===============================
+// DASHBOARD DATA
+// ===============================
+app.get("/dashboard-data", (req, res) => {
+    res.json(DB);
+});
+
+// ===============================
+// PDF → TEXT
+// ===============================
+app.post("/pdf-to-text", upload.single("file"), async (req, res) => {
+    const buffer = fs.readFileSync(req.file.path);
+    const data = await pdfParse(buffer);
+    res.json({ text: data.text });
+});
+
+// ===============================
+// TEXT → PDF
+// ===============================
+app.post("/text-to-pdf", async (req, res) => {
+    const { text } = req.body;
+
+    const pdfDoc = await PDFDocument.create();
+    const page = pdfDoc.addPage([600, 800]);
+
+    page.drawText(text || "", {
+        x: 50,
+        y: 700,
+        size: 12,
+        color: rgb(0,0,0)
+    });
+
+    const pdfBytes = await pdfDoc.save();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.send(Buffer.from(pdfBytes));
+});
+
+// ===============================
+// COUPON CHECK
+// ===============================
+app.post("/check-coupon", (req, res) => {
+    const { code } = req.body;
+
+    if(DB.coupons[code]){
+        res.json({ valid:true, discount: DB.coupons[code].discount });
+    } else {
+        res.json({ valid:false });
+    }
+});
+
+// ===============================
+// ADMIN: UPDATE PLANS
+// ===============================
+app.post("/admin/plans", (req, res) => {
+    DB.plans.free.price = req.body.free || 0;
+    DB.plans.premium.price = req.body.premium || 0;
+    DB.plans.pro.price = req.body.pro || 0;
+
+    res.json({ success:true });
+});
+
+// ===============================
+// ADMIN: CREATE COUPON
+// ===============================
+app.post("/admin/coupon", (req, res) => {
+    DB.coupons[req.body.code] = {
+        discount: req.body.discount
+    };
+
+    res.json({ success:true });
+});
+
+// ===============================
+// ADMIN: TOGGLE OFFER
+// ===============================
+app.post("/admin/offer", (req, res) => {
+    DB.offers.active = !DB.offers.active;
+    res.json({ success:true });
+});
+
+// ===============================
+app.listen(3000, () => {
+    console.log("SaaS running: http://localhost:3000");
+});
